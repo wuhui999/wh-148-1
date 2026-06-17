@@ -47,6 +47,16 @@ class AuditAction(str, Enum):
     TASK_COMPLETED = "task_completed"
     TASK_CANCELLED = "task_cancelled"
     DELAY_RECORDED = "delay_recorded"
+    DUTY_RULE_CREATED = "duty_rule_created"
+    DUTY_RULE_UPDATED = "duty_rule_updated"
+    DUTY_RULE_DELETED = "duty_rule_deleted"
+    DUTY_VIOLATION_REJECTED = "duty_violation_rejected"
+
+
+class ViolationType(str, Enum):
+    DAILY_TASK_LIMIT = "daily_task_limit"
+    REST_INTERVAL = "rest_interval"
+    CONSECUTIVE_WORK = "consecutive_work"
 
 
 class Token(BaseModel):
@@ -315,6 +325,7 @@ class TaskMatchResult(BaseModel):
     next_available_window: Optional[TideWindowSimple] = None
     available_pilots: List[PilotResponse] = []
     available_vessels: List[TransportVesselResponse] = []
+    duty_excluded_pilots: List[dict] = []
 
 
 class AuditLogBase(BaseModel):
@@ -357,3 +368,71 @@ class DelayStats(BaseModel):
     delay_reasons: List[dict] = []
     period_start: datetime
     period_end: datetime
+
+
+class PilotDutyRuleBase(BaseModel):
+    max_tasks_per_day: int = Field(..., ge=1, le=20, description="单日最大任务数")
+    min_rest_minutes_between_tasks: int = Field(..., ge=0, le=720, description="两单之间最少休息分钟数")
+    max_consecutive_work_minutes: int = Field(..., ge=30, le=1440, description="连续工作最长分钟数")
+
+
+class PilotDutyRuleCreate(PilotDutyRuleBase):
+    pilot_id: Optional[int] = None
+    is_active: bool = True
+
+
+class PilotDutyRuleUpdate(BaseModel):
+    max_tasks_per_day: Optional[int] = Field(None, ge=1, le=20)
+    min_rest_minutes_between_tasks: Optional[int] = Field(None, ge=0, le=720)
+    max_consecutive_work_minutes: Optional[int] = Field(None, ge=30, le=1440)
+    is_active: Optional[bool] = None
+
+
+class PilotDutyRuleResponse(PilotDutyRuleBase):
+    id: int
+    pilot_id: Optional[int] = None
+    is_global: bool
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+    pilot: Optional[PilotResponse] = None
+
+    class Config:
+        from_attributes = True
+
+
+class DutyViolationResponse(BaseModel):
+    id: int
+    pilot_id: int
+    task_id: Optional[int] = None
+    violation_type: ViolationType
+    violation_detail: Optional[str] = None
+    rejected_at: datetime
+
+    pilot: PilotResponse
+    task: Optional[PilotTaskResponse] = None
+
+    class Config:
+        from_attributes = True
+
+
+class PilotDutyStatsItem(BaseModel):
+    pilot_id: int
+    pilot_name: str
+    license_number: str
+    total_tasks: int = 0
+    completed_tasks: int = 0
+    in_progress_tasks: int = 0
+    total_duty_minutes: float = 0.0
+    duty_rejections: int = 0
+    daily_limit_rejections: int = 0
+    rest_interval_rejections: int = 0
+    continuous_limit_rejections: int = 0
+    period_start: datetime
+    period_end: datetime
+
+
+class PilotDutyStatsResponse(BaseModel):
+    period_start: datetime
+    period_end: datetime
+    pilot_stats: List[PilotDutyStatsItem] = []

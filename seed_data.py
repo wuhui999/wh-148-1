@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 from database import engine, SessionLocal
 from models import (
     Base, User, Pilot, Berth, Ship, TideWindow, SafetyMarginConfig,
-    TransportVessel, UserRole, ShipType, PilotQualification, VesselStatus
+    TransportVessel, PilotDutyRule, UserRole, ShipType, PilotQualification, VesselStatus
 )
 from security import get_password_hash
 
@@ -272,11 +272,41 @@ try:
     else:
         print("- 交通艇数据已存在，跳过")
 
+    if not db.query(PilotDutyRule).filter(PilotDutyRule.pilot_id.is_(None)).first():
+        db.add(PilotDutyRule(
+            pilot_id=None,
+            max_tasks_per_day=5,
+            min_rest_minutes_between_tasks=60,
+            max_consecutive_work_minutes=480,
+            is_active=True
+        ))
+        print("✓ 全局执勤规则已创建 (每日5单 / 休息60分钟 / 连续8小时)")
+    else:
+        print("- 全局执勤规则已存在，跳过")
+
+    pilots = db.query(Pilot).all()
+    if pilots and not db.query(PilotDutyRule).filter(PilotDutyRule.pilot_id.isnot(None)).first():
+        pilot_li = db.query(Pilot).filter(Pilot.name == "李引航").first()
+        if pilot_li:
+            db.add(PilotDutyRule(
+                pilot_id=pilot_li.id,
+                max_tasks_per_day=2,
+                min_rest_minutes_between_tasks=120,
+                max_consecutive_work_minutes=240,
+                is_active=True
+            ))
+            print(f"✓ 个人执勤规则已创建 (李引航：每日2单 / 休息120分钟 / 连续4小时 - 更严格)")
+    else:
+        print("- 个人执勤规则已存在，跳过")
+
     db.commit()
     print("\n种子数据初始化完成！")
     print("\n默认登录账号：")
     print("  管理员: admin / admin123")
     print("  调度员: dispatcher / disp123")
+    print("\n执勤规则说明：")
+    print("  - 全局默认: 每日5单，两单间休息≥60分钟，连续工作≤480分钟(8小时)")
+    print("  - 李引航个人规则: 每日2单，两单间休息≥120分钟，连续工作≤240分钟(4小时) 【更严，用于演示】")
     print("\n启动服务: python main.py  (端口 8001)")
     print("API文档: http://localhost:8001/docs")
 

@@ -49,6 +49,16 @@ class AuditAction(str, enum.Enum):
     TASK_COMPLETED = "task_completed"
     TASK_CANCELLED = "task_cancelled"
     DELAY_RECORDED = "delay_recorded"
+    DUTY_RULE_CREATED = "duty_rule_created"
+    DUTY_RULE_UPDATED = "duty_rule_updated"
+    DUTY_RULE_DELETED = "duty_rule_deleted"
+    DUTY_VIOLATION_REJECTED = "duty_violation_rejected"
+
+
+class ViolationType(str, enum.Enum):
+    DAILY_TASK_LIMIT = "daily_task_limit"
+    REST_INTERVAL = "rest_interval"
+    CONSECUTIVE_WORK = "consecutive_work"
 
 
 class User(Base):
@@ -193,3 +203,32 @@ class AuditLog(Base):
 
     task = relationship("PilotTask", back_populates="audit_logs")
     operator = relationship("User", back_populates="audit_logs")
+
+
+class PilotDutyRule(Base):
+    __tablename__ = "pilot_duty_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    pilot_id = Column(Integer, ForeignKey("pilots.id"), nullable=True, unique=True)
+    max_tasks_per_day = Column(Integer, nullable=False, default=5)
+    min_rest_minutes_between_tasks = Column(Integer, nullable=False, default=60)
+    max_consecutive_work_minutes = Column(Integer, nullable=False, default=480)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    pilot = relationship("Pilot")
+
+
+class DutyViolationLog(Base):
+    __tablename__ = "duty_violation_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    pilot_id = Column(Integer, ForeignKey("pilots.id"), nullable=False, index=True)
+    task_id = Column(Integer, ForeignKey("pilot_tasks.id"), nullable=True, index=True)
+    violation_type = Column(Enum(ViolationType), nullable=False)
+    violation_detail = Column(String(255), nullable=True)
+    rejected_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    pilot = relationship("Pilot")
+    task = relationship("PilotTask")
