@@ -12,7 +12,7 @@ from models import (
     User, Pilot, Berth, Ship, TideWindow, SafetyMarginConfig,
     TransportVessel, PilotTask, AuditLog, UserRole, TaskStatus,
     ShipType, PilotQualification, VesselStatus, AuditAction,
-    PilotDutyRule, DutyViolationLog, ViolationType
+    PilotDutyRule, DutyViolationLog, ViolationType, DutyRuleAuditLog
 )
 from schemas import (
     Token, UserCreate, UserResponse, PilotCreate, PilotResponse,
@@ -25,7 +25,8 @@ from schemas import (
     PilotTaskResponse, TaskMatchResult, AuditLogResponse,
     WindowUtilizationStats, DelayStats,
     PilotDutyRuleCreate, PilotDutyRuleUpdate, PilotDutyRuleResponse,
-    DutyViolationResponse, PilotDutyStatsResponse, PilotDutyStatsItem
+    DutyViolationResponse, PilotDutyStatsResponse, PilotDutyStatsItem,
+    DutyRuleAuditLogResponse
 )
 from security import (
     get_password_hash, authenticate_user, create_access_token,
@@ -219,8 +220,9 @@ def check_pilot_duty_rule(
     )
     if exclude_task_id:
         query = query.filter(PilotTask.id != exclude_task_id)
-    day_tasks = query.all()
-    day_task_count = len(day_tasks)
+    existing_tasks = query.all()
+    day_task_count = len(existing_tasks)
+
     if day_task_count >= rule.max_tasks_per_day:
         reasons.append(
             f"单日任务数已达上限 {rule.max_tasks_per_day} 单（当前 {day_task_count} 单）"
@@ -228,65 +230,63 @@ def check_pilot_duty_rule(
         violations.append(ViolationType.DAILY_TASK_LIMIT)
 
     min_rest = timedelta(minutes=rule.min_rest_minutes_between_tasks)
-    task_start = planned_time
-    task_end = planned_time + timedelta(minutes=duration_minutes)
+    new_start = planned_time
+    new_end = planned_time + timedelta(minutes=duration_minutes)
 
-    for t in day_tasks:
-        if exclude_task_id and t.id == exclude_task_id:
-            continue
+    for t in existing_tasks:
         existing_start = t.planned_boarding_time
         existing_end = t.planned_boarding_time + timedelta(minutes=duration_minutes)
 
-        if existing_end <= task_start and task_start - existing_end < min_rest:
-            gap = (task_start - existing_end).total_seconds() / 60
-            reasons.append(
-                f"与前一单（{existing_start.strftime('%H:%M')}）间隔仅 {gap:.0f} 分钟，不足最少休息 {rule.min_rest_minutes_between_tasks} 分钟"
-            )
-            violations.append(ViolationType.REST_INTERVAL)
-            break
+        if existing_end <= new_start:
+            gap = (new_start - existing_end).total_seconds() / 60
+            if gap < rule.min_rest_minutes_between_tasks:
+                reasons.append(
+                    f"与前一单（{existing_start.strftime('%H:%M')}结束）间隔仅 {gap:.0f} 分钟，不足最少休息 {rule.min_rest_minutes_between_tasks} 分钟"
+                )
+                violations.append(ViolationType.REST_INTERVAL)
+                break
 
-        if task_end <= existing_start and existing_start - task_end < min_rest:
-            gap = (existing_start - task_end).total_seconds() / 60
-            reasons.append(
-                f"与后一单（{existing_start.strftime('%H:%M')}）间隔仅 {gap:.0f} 分钟，不足最少休息 {rule.min_rest_minutes_between_tasks} 分钟"
-            )
-            violations.append(ViolationType.REST_INTERVAL)
-            break
+        if new_end <= existing_start:
+            gap = (existing_start - new_end).total_seconds() / 60
+            if gap < rule.min_rest_minutes_between_tasks:
+                reasons.append(
+                    f"与后一单（{existing_start.strftime('%H:%M')}开始）间隔仅 {gap:.0f} 分钟，不足最少休息 {rule.min_rest_minutes_between_tasks} 分钟"
+                )
+                violations.append(ViolationType.REST_INTERVAL)
+                break
 
-    consecutive_limit = timedelta(minutes=rule.max_consecutive_work_minutes)
+    consecutive_limit = rule.max_consecutive_work_minutes
+    all_task_slots = []
+    for t in existing_tasks:
+        all_task_slots.append((t.planned_boarding_time, t.planned_boarding_time + timedelta(minutes=duration_minutes)))
+    all_task_slots.append((new_start, new_end))
+    all_task_slots.sort(key=lambda x: x[0])
 
-    all_tasks = list(day_tasks)
-    all_tasks.sort(key=lambda t: t.planned_boarding_time)
+    if all_task_slots:
+        cluster_start = all_task_slots[0][0]
+        cluster_end = all_task_slots[0][1]
+        max_consecutive_minutes = 0
 
-    if all_tasks:
-        cluster_start = all_tasks[0].planned_boarding_time
-        cluster_end = all_tasks[0].planned_boarding_time + timedelta(minutes=duration_minutes)
-        max_consecutive = timedelta(0)
-
-        for i in range(1, len(all_tasks)):
-            if exclude_task_id and all_tasks[i].id == exclude_task_id:
-                continue
-            t_start = all_tasks[i].planned_boarding_time
-            t_end = t_start + timedelta(minutes=duration_minutes)
+        for i in range(1, len(all_task_slots)):
+            t_start, t_end = all_task_slots[i]
             gap = t_start - cluster_end
 
             if gap < min_rest:
                 cluster_end = max(cluster_end, t_end)
             else:
-                cluster_duration = cluster_end - cluster_start
-                if cluster_duration > max_consecutive:
-                    max_consecutive = cluster_duration
+                cluster_minutes = (cluster_end - cluster_start).total_seconds() / 60
+                if cluster_minutes > max_consecutive_minutes:
+                    max_consecutive_minutes = cluster_minutes
                 cluster_start = t_start
                 cluster_end = t_end
 
-        cluster_duration = cluster_end - cluster_start
-        if cluster_duration > max_consecutive:
-            max_consecutive = cluster_duration
+        cluster_minutes = (cluster_end - cluster_start).total_seconds() / 60
+        if cluster_minutes > max_consecutive_minutes:
+            max_consecutive_minutes = cluster_minutes
 
-        new_total_duration = max_consecutive + timedelta(minutes=duration_minutes)
-        if new_total_duration > consecutive_limit:
+        if max_consecutive_minutes > consecutive_limit:
             reasons.append(
-                f"连续工作时长将达 {new_total_duration.total_seconds()/60:.0f} 分钟，超过上限 {rule.max_consecutive_work_minutes} 分钟"
+                f"连续工作时长将达 {max_consecutive_minutes:.0f} 分钟，超过上限 {consecutive_limit} 分钟"
             )
             violations.append(ViolationType.CONSECUTIVE_WORK)
 
@@ -843,10 +843,12 @@ def create_duty_rule(
     db.flush()
 
     remark = "创建全局执勤规则" if rule_data.pilot_id is None else f"创建引航员 {rule_data.pilot_id} 的执勤规则"
-    db.add(AuditLog(
-        task_id=0,
+    db.add(DutyRuleAuditLog(
+        rule_id=db_rule.id,
+        pilot_id=rule_data.pilot_id,
         operator_id=current_user.id,
         action=AuditAction.DUTY_RULE_CREATED,
+        is_global=rule_data.pilot_id is None,
         new_value=f"max_tasks={rule_data.max_tasks_per_day}, min_rest={rule_data.min_rest_minutes_between_tasks}min, max_consecutive={rule_data.max_consecutive_work_minutes}min",
         remark=remark
     ))
@@ -897,10 +899,12 @@ def update_duty_rule(
     )
 
     remark = "更新全局执勤规则" if rule.pilot_id is None else f"更新引航员 {rule.pilot_id} 的执勤规则"
-    db.add(AuditLog(
-        task_id=0,
+    db.add(DutyRuleAuditLog(
+        rule_id=rule.id,
+        pilot_id=rule.pilot_id,
         operator_id=current_user.id,
         action=AuditAction.DUTY_RULE_UPDATED,
+        is_global=rule.pilot_id is None,
         old_value=old_value,
         new_value=new_value,
         remark=remark
@@ -933,10 +937,12 @@ def delete_duty_rule(
         raise HTTPException(status_code=404, detail="Duty rule not found")
 
     remark = "删除全局执勤规则" if rule.pilot_id is None else f"删除引航员 {rule.pilot_id} 的执勤规则"
-    db.add(AuditLog(
-        task_id=0,
+    db.add(DutyRuleAuditLog(
+        rule_id=rule.id,
+        pilot_id=rule.pilot_id,
         operator_id=current_user.id,
         action=AuditAction.DUTY_RULE_DELETED,
+        is_global=rule.pilot_id is None,
         old_value=f"max_tasks={rule.max_tasks_per_day}, min_rest={rule.min_rest_minutes_between_tasks}min",
         remark=remark
     ))
@@ -1512,6 +1518,36 @@ def list_duty_violations(
         query = query.filter(DutyViolationLog.rejected_at <= period_end)
 
     logs = query.order_by(DutyViolationLog.rejected_at.desc()).offset(skip).limit(limit).all()
+    return logs
+
+
+@app.get("/duty-rules/audit-logs", response_model=List[DutyRuleAuditLogResponse], tags=["执勤规则"])
+def list_duty_rule_audit_logs(
+    rule_id: Optional[int] = None,
+    pilot_id: Optional[int] = None,
+    is_global: Optional[bool] = None,
+    action: Optional[AuditAction] = None,
+    period_start: Optional[datetime] = None,
+    period_end: Optional[datetime] = None,
+    skip: int = 0, limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_dispatcher)
+):
+    query = db.query(DutyRuleAuditLog)
+    if rule_id:
+        query = query.filter(DutyRuleAuditLog.rule_id == rule_id)
+    if pilot_id:
+        query = query.filter(DutyRuleAuditLog.pilot_id == pilot_id)
+    if is_global is not None:
+        query = query.filter(DutyRuleAuditLog.is_global == is_global)
+    if action:
+        query = query.filter(DutyRuleAuditLog.action == action)
+    if period_start:
+        query = query.filter(DutyRuleAuditLog.created_at >= period_start)
+    if period_end:
+        query = query.filter(DutyRuleAuditLog.created_at <= period_end)
+
+    logs = query.order_by(DutyRuleAuditLog.created_at.desc()).offset(skip).limit(limit).all()
     return logs
 
 

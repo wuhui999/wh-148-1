@@ -232,3 +232,22 @@ class DutyViolationLog(Base):
 
     pilot = relationship("Pilot")
     task = relationship("PilotTask")
+
+
+class DutyRuleAuditLog(Base):
+    __tablename__ = "duty_rule_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_id = Column(Integer, ForeignKey("pilot_duty_rules.id"), nullable=True, index=True)
+    pilot_id = Column(Integer, ForeignKey("pilots.id"), nullable=True, index=True)
+    operator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    action = Column(Enum(AuditAction), nullable=False)
+    is_global = Column(Boolean, default=False, nullable=False)
+    old_value = Column(Text, nullable=True)
+    new_value = Column(Text, nullable=True)
+    remark = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    rule = relationship("PilotDutyRule")
+    pilot = relationship("Pilot")
+    operator = relationship("User")

@@ -436,3 +436,22 @@ class PilotDutyStatsResponse(BaseModel):
     period_start: datetime
     period_end: datetime
     pilot_stats: List[PilotDutyStatsItem] = []
+
+
+class DutyRuleAuditLogResponse(BaseModel):
+    id: int
+    rule_id: Optional[int] = None
+    pilot_id: Optional[int] = None
+    operator_id: int
+    action: AuditAction
+    is_global: bool
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
+    remark: Optional[str] = None
+    created_at: datetime
+
+    pilot: Optional[PilotResponse] = None
+    operator: Optional[UserResponse] = None
+
+    class Config:
+        from_attributes = True
