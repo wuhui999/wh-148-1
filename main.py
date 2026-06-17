@@ -12,7 +12,8 @@ from models import (
     User, Pilot, Berth, Ship, TideWindow, SafetyMarginConfig,
     TransportVessel, PilotTask, AuditLog, UserRole, TaskStatus,
     ShipType, PilotQualification, VesselStatus, AuditAction,
-    PilotDutyRule, DutyViolationLog, ViolationType, DutyRuleAuditLog
+    PilotDutyRule, DutyViolationLog, ViolationType, DutyRuleAuditLog,
+    RecommendationStats
 )
 from schemas import (
     Token, UserCreate, UserResponse, PilotCreate, PilotResponse,
@@ -26,7 +27,9 @@ from schemas import (
     WindowUtilizationStats, DelayStats,
     PilotDutyRuleCreate, PilotDutyRuleUpdate, PilotDutyRuleResponse,
     DutyViolationResponse, PilotDutyStatsResponse, PilotDutyStatsItem,
-    DutyRuleAuditLogResponse
+    DutyRuleAuditLogResponse,
+    RecommendationItem, RecommendationResponse, RecommendationAssignRequest,
+    RecommendationStatsResponse, RecommendationBlockReason
 )
 from security import (
     get_password_hash, authenticate_user, create_access_token,
@@ -325,6 +328,201 @@ def save_duty_violation_independent(
         db.rollback()
     finally:
         db.close()
+
+
+def increment_recommendation_stat(db: Session, stat_type: str):
+    """
+    增加推荐统计数据
+    stat_type: query, assign_success, assign_fail
+    """
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    stat = db.query(RecommendationStats).filter(
+        RecommendationStats.date == today
+    ).first()
+    if not stat:
+        stat = RecommendationStats(date=today)
+        db.add(stat)
+        db.flush()
+    if stat_type == "query":
+        stat.query_count += 1
+    elif stat_type == "assign_success":
+        stat.assign_success_count += 1
+    elif stat_type == "assign_fail":
+        stat.assign_fail_count += 1
+    db.flush()
+
+
+def get_pilot_task_count_today(db: Session, pilot_id: int, planned_time: datetime) -> int:
+    """获取引航员当天已有的任务数"""
+    day_start = planned_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+    count = db.query(PilotTask).filter(
+        PilotTask.pilot_id == pilot_id,
+        PilotTask.status.in_([TaskStatus.PENDING, TaskStatus.ASSIGNED, TaskStatus.IN_PROGRESS, TaskStatus.COMPLETED]),
+        PilotTask.planned_boarding_time >= day_start,
+        PilotTask.planned_boarding_time < day_end
+    ).count()
+    return count
+
+
+def get_pilot_rest_minutes(db: Session, pilot_id: int, planned_time: datetime) -> float:
+    """计算引航员距离上一个任务的休息时间（分钟）"""
+    day_start = planned_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    prev_task = (
+        db.query(PilotTask)
+        .filter(
+            PilotTask.pilot_id == pilot_id,
+            PilotTask.status.in_([TaskStatus.PENDING, TaskStatus.ASSIGNED, TaskStatus.IN_PROGRESS, TaskStatus.COMPLETED]),
+            PilotTask.planned_boarding_time < planned_time,
+            PilotTask.planned_boarding_time >= day_start
+        )
+        .order_by(PilotTask.planned_boarding_time.desc())
+        .first()
+    )
+    if not prev_task:
+        return float('inf')
+    prev_end = prev_task.planned_boarding_time + timedelta(minutes=120)
+    rest_minutes = (planned_time - prev_end).total_seconds() / 60
+    return max(0, rest_minutes)
+
+
+def get_vessel_task_count_today(db: Session, vessel_id: int, planned_time: datetime) -> int:
+    """获取交通艇当天已有的任务数"""
+    day_start = planned_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+    count = db.query(PilotTask).filter(
+        PilotTask.vessel_id == vessel_id,
+        PilotTask.status.in_([TaskStatus.PENDING, TaskStatus.ASSIGNED, TaskStatus.IN_PROGRESS]),
+        PilotTask.planned_boarding_time >= day_start,
+        PilotTask.planned_boarding_time < day_end
+    ).count()
+    return count
+
+
+def qualification_score(qualification: PilotQualification) -> int:
+    """资质评分：等级越高分数越高"""
+    if qualification == PilotQualification.MASTER:
+        return 3
+    elif qualification == PilotQualification.SENIOR:
+        return 2
+    elif qualification == PilotQualification.JUNIOR:
+        return 1
+    return 0
+
+
+def generate_recommendations(
+    db: Session, task_id: int, max_count: int = 3,
+    exclude_task_id: Optional[int] = None
+) -> List[RecommendationItem]:
+    """
+    生成派单推荐方案
+    返回最多 max_count 条推荐，按推荐度从高到低排序
+    """
+    task = db.query(PilotTask).filter(PilotTask.id == task_id).first()
+    if not task:
+        return []
+
+    ship = db.query(Ship).filter(Ship.id == task.ship_id).first()
+    if not ship:
+        return []
+
+    planned_time = task.planned_boarding_time
+    duration_minutes = 120
+
+    all_pilots = db.query(Pilot).filter(Pilot.is_active == True).all()
+    all_vessels = db.query(TransportVessel).all()
+
+    candidates = []
+
+    for pilot in all_pilots:
+        for vessel in all_vessels:
+            block_reasons = []
+            reasons = []
+            available = True
+
+            if ship.ship_type.value not in pilot.certified_ship_types.split(","):
+                block_reasons.append(RecommendationBlockReason.QUALIFICATION)
+                reasons.append(f"资质不匹配船舶类型 {ship.ship_type.value}")
+                available = False
+
+            if not check_pilot_availability(db, pilot.id, planned_time, duration_minutes, exclude_task_id or task_id):
+                block_reasons.append(RecommendationBlockReason.TIME_CONFLICT)
+                reasons.append("引航员该时段已有任务冲突")
+                available = False
+
+            duty_passed, duty_reasons, _ = check_pilot_duty_rule(
+                db, pilot.id, planned_time, duration_minutes, exclude_task_id or task_id
+            )
+            if not duty_passed:
+                block_reasons.append(RecommendationBlockReason.DUTY_RULE)
+                reasons.extend(duty_reasons)
+                available = False
+
+            if vessel.status == VesselStatus.IN_MAINTENANCE:
+                block_reasons.append(RecommendationBlockReason.VESSEL)
+                reasons.append("交通艇维护中，不可用")
+                available = False
+
+            if not check_vessel_availability(db, vessel.id, planned_time, duration_minutes, exclude_task_id or task_id):
+                block_reasons.append(RecommendationBlockReason.VESSEL)
+                reasons.append("交通艇该时段已被占用")
+                available = False
+
+            score = 0.0
+            if available:
+                pilot_tasks = get_pilot_task_count_today(db, pilot.id, planned_time)
+                rest_minutes = get_pilot_rest_minutes(db, pilot.id, planned_time)
+                vessel_tasks = get_vessel_task_count_today(db, vessel.id, planned_time)
+                qual_score = qualification_score(pilot.qualification)
+
+                score = (
+                    (10 - pilot_tasks) * 10 + \
+                    qual_score * 5 + \
+                    min(rest_minutes / 60, 8) * 2 + \
+                    (5 - vessel_tasks) * 3
+                )
+
+                reasons.append(f"当日任务数: {pilot_tasks}单")
+                reasons.append(f"资质等级: {pilot.qualification.value}")
+                if rest_minutes == float('inf'):
+                    reasons.append("当日暂无任务，休息充足")
+                else:
+                    reasons.append(f"距上一单休息: {rest_minutes:.0f}分钟")
+                reasons.append(f"交通艇当日任务: {vessel_tasks}单")
+            else:
+                score = -1000.0
+
+            candidates.append({
+                "pilot": pilot,
+                "vessel": vessel,
+                "available": available,
+                "score": score,
+                "reasons": reasons,
+                "block_reasons": block_reasons
+            })
+
+    available_candidates = [c for c in candidates if c["available"]]
+    unavailable_candidates = [c for c in candidates if not c["available"]]
+
+    available_candidates.sort(key=lambda x: x["score"], reverse=True)
+    unavailable_candidates.sort(key=lambda x: len(x["block_reasons"]))
+
+    sorted_candidates = available_candidates + unavailable_candidates
+
+    result = []
+    for i, cand in enumerate(sorted_candidates[:max_count]):
+        item = RecommendationItem(
+            rank=i + 1,
+            available=cand["available"],
+            pilot=PilotResponse.model_validate(cand["pilot"]),
+            vessel=TransportVesselResponse.model_validate(cand["vessel"]),
+            score=round(cand["score"], 2),
+            reasons=cand["reasons"],
+            block_reasons=cand["block_reasons"]
+        )
+        result.append(item)
+
+    return result
 
 
 @app.post("/token", response_model=Token, tags=["认证"])
@@ -1094,6 +1292,11 @@ def create_pilot_task(
         db.add(db_task)
         db.flush()
         create_audit_log(db, db_task.id, current_user.id, AuditAction.TASK_CREATED, remark=f"创建任务 {task_number}")
+        db.flush()
+
+        recommendations = generate_recommendations(db, db_task.id, max_count=3)
+        increment_recommendation_stat(db, "query")
+
         db.commit()
         db.refresh(db_task)
 
@@ -1105,7 +1308,8 @@ def create_pilot_task(
             next_available_window=None,
             available_pilots=[PilotResponse.model_validate(p) for p in duty_ok_pilots],
             available_vessels=[TransportVesselResponse.model_validate(v) for v in available_vessels],
-            duty_excluded_pilots=duty_excluded
+            duty_excluded_pilots=duty_excluded,
+            recommendations=recommendations
         )
     else:
         return TaskMatchResult(
@@ -1115,7 +1319,8 @@ def create_pilot_task(
             next_available_window=TideWindowSimple.model_validate(next_window) if next_window else None,
             available_pilots=[PilotResponse.model_validate(p) for p in duty_ok_pilots],
             available_vessels=[TransportVesselResponse.model_validate(v) for v in available_vessels],
-            duty_excluded_pilots=duty_excluded
+            duty_excluded_pilots=duty_excluded,
+            recommendations=[]
         )
 
 
@@ -1147,12 +1352,13 @@ def get_task(
     return task
 
 
-@app.post("/tasks/{task_id}/assign", response_model=PilotTaskResponse, tags=["任务"])
-def assign_task(
-    task_id: int, assign: PilotTaskAssign,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_dispatcher)
-):
+def do_assign_task(
+    db: Session,
+    task_id: int,
+    pilot_id: int,
+    vessel_id: int,
+    current_user: User
+) -> PilotTask:
     task = db.query(PilotTask).filter(PilotTask.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -1174,7 +1380,7 @@ def assign_task(
             detail=f"计划登轮时间超出潮汐安全窗口。窗口范围: {window.window_start} ~ {window.window_end}"
         )
 
-    pilot = db.query(Pilot).filter(Pilot.id == assign.pilot_id).first()
+    pilot = db.query(Pilot).filter(Pilot.id == pilot_id).first()
     if not pilot:
         raise HTTPException(status_code=404, detail="Pilot not found")
     if not pilot.is_active:
@@ -1182,55 +1388,64 @@ def assign_task(
     if ship.ship_type.value not in pilot.certified_ship_types.split(","):
         raise HTTPException(status_code=400, detail=f"引航员资质不匹配船舶类型 {ship.ship_type.value}")
 
-    if not check_pilot_availability(db, assign.pilot_id, planned, exclude_task_id=task_id):
+    if not check_pilot_availability(db, pilot_id, planned, exclude_task_id=task_id):
         raise HTTPException(status_code=400, detail="引航员该时段已有任务冲突")
 
     duty_passed, duty_reasons, duty_violations = check_pilot_duty_rule(
-        db, assign.pilot_id, planned, exclude_task_id=task_id,
+        db, pilot_id, planned, exclude_task_id=task_id,
         record_violation=False, task_id=task_id
     )
     if not duty_passed:
         save_duty_violation_independent(
-            assign.pilot_id, task_id, duty_violations, "; ".join(duty_reasons)
+            pilot_id, task_id, duty_violations, "; ".join(duty_reasons)
         )
         raise HTTPException(
             status_code=400,
             detail="引航员不符合执勤约束规则：" + "；".join(duty_reasons)
         )
 
-    vessel = db.query(TransportVessel).filter(TransportVessel.id == assign.vessel_id).first()
+    vessel = db.query(TransportVessel).filter(TransportVessel.id == vessel_id).first()
     if not vessel:
         raise HTTPException(status_code=404, detail="Vessel not found")
     if vessel.status == VesselStatus.IN_MAINTENANCE:
         raise HTTPException(status_code=400, detail="交通艇维护中，不可用")
-    if not check_vessel_availability(db, assign.vessel_id, planned, exclude_task_id=task_id):
+    if not check_vessel_availability(db, vessel_id, planned, exclude_task_id=task_id):
         raise HTTPException(status_code=400, detail="交通艇该时段已被占用")
 
     old_pilot = task.pilot_id
     old_vessel = task.vessel_id
     is_reassign = task.status == TaskStatus.ASSIGNED
 
-    task.pilot_id = assign.pilot_id
-    task.vessel_id = assign.vessel_id
+    task.pilot_id = pilot_id
+    task.vessel_id = vessel_id
     task.status = TaskStatus.ASSIGNED
 
     if is_reassign:
         create_audit_log(
             db, task.id, current_user.id, AuditAction.TASK_REASSIGNED,
             old_value=f"pilot={old_pilot}, vessel={old_vessel}",
-            new_value=f"pilot={assign.pilot_id}, vessel={assign.vessel_id}",
+            new_value=f"pilot={pilot_id}, vessel={vessel_id}",
             remark="任务改派"
         )
     else:
         create_audit_log(
             db, task.id, current_user.id, AuditAction.TASK_ASSIGNED,
             old_value=None,
-            new_value=f"pilot={assign.pilot_id}, vessel={assign.vessel_id}",
+            new_value=f"pilot={pilot_id}, vessel={vessel_id}",
             remark="任务派单"
         )
     db.commit()
     db.refresh(task)
     return task
+
+
+@app.post("/tasks/{task_id}/assign", response_model=PilotTaskResponse, tags=["任务"])
+def assign_task(
+    task_id: int, assign: PilotTaskAssign,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_dispatcher)
+):
+    return do_assign_task(db, task_id, assign.pilot_id, assign.vessel_id, current_user)
 
 
 @app.post("/tasks/{task_id}/start", response_model=PilotTaskResponse, tags=["任务"])
@@ -1549,6 +1764,125 @@ def list_duty_rule_audit_logs(
 
     logs = query.order_by(DutyRuleAuditLog.created_at.desc()).offset(skip).limit(limit).all()
     return logs
+
+
+@app.get("/tasks/{task_id}/recommendations", response_model=RecommendationResponse, tags=["派单推荐"])
+def get_task_recommendations(
+    task_id: int,
+    max_count: int = 3,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_dispatcher)
+):
+    task = db.query(PilotTask).filter(PilotTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.status not in [TaskStatus.PENDING, TaskStatus.ASSIGNED]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"当前任务状态为 {task.status.value}，无法获取推荐"
+        )
+
+    if max_count < 1 or max_count > 20:
+        max_count = 3
+
+    recommendations = generate_recommendations(db, task_id, max_count=max_count)
+
+    increment_recommendation_stat(db, "query")
+    db.commit()
+
+    return RecommendationResponse(
+        task_id=task_id,
+        recommendations=recommendations,
+        total_count=len(recommendations)
+    )
+
+
+@app.post("/tasks/{task_id}/assign-by-recommendation", response_model=PilotTaskResponse, tags=["派单推荐"])
+def assign_task_by_recommendation(
+    task_id: int,
+    assign_req: RecommendationAssignRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_dispatcher)
+):
+    task = db.query(PilotTask).filter(PilotTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.status not in [TaskStatus.PENDING, TaskStatus.ASSIGNED]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"当前任务状态为 {task.status.value}，无法派单"
+        )
+
+    old_status = task.status
+
+    recommendations = generate_recommendations(db, task_id, max_count=10)
+
+    if assign_req.rank < 1 or assign_req.rank > len(recommendations):
+        increment_recommendation_stat(db, "assign_fail")
+        db.commit()
+        raise HTTPException(
+            status_code=400,
+            detail=f"推荐排名无效，有效范围为 1-{len(recommendations)}"
+        )
+
+    rec = recommendations[assign_req.rank - 1]
+
+    if not rec.available:
+        increment_recommendation_stat(db, "assign_fail")
+        db.commit()
+        block_detail = "、".join([br.value for br in rec.block_reasons])
+        raise HTTPException(
+            status_code=400,
+            detail=f"该推荐方案不可用，原因：{block_detail} - {'; '.join(rec.reasons)}"
+        )
+
+    try:
+        result = do_assign_task(db, task_id, rec.pilot.id, rec.vessel.id, current_user)
+
+        increment_recommendation_stat(db, "assign_success")
+        db.commit()
+        return result
+    except HTTPException as e:
+        db.rollback()
+        increment_recommendation_stat(db, "assign_fail")
+        db.commit()
+        raise e
+    except Exception as e:
+        db.rollback()
+        increment_recommendation_stat(db, "assign_fail")
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"派单失败: {str(e)}")
+
+
+@app.get("/stats/recommendation", response_model=RecommendationStatsResponse, tags=["统计"])
+def get_recommendation_stats(
+    period_start: Optional[datetime] = None,
+    period_end: Optional[datetime] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_dispatcher)
+):
+    query = db.query(RecommendationStats)
+
+    if period_start:
+        query = query.filter(RecommendationStats.date >= period_start)
+    if period_end:
+        query = query.filter(RecommendationStats.date <= period_end)
+
+    stats = query.all()
+
+    total_query = sum(s.query_count for s in stats)
+    total_success = sum(s.assign_success_count for s in stats)
+    total_fail = sum(s.assign_fail_count for s in stats)
+
+    return RecommendationStatsResponse(
+        period_start=period_start,
+        period_end=period_end,
+        query_count=total_query,
+        assign_success_count=total_success,
+        assign_fail_count=total_fail
+    )
 
 
 if __name__ == "__main__":

@@ -251,3 +251,15 @@ class DutyRuleAuditLog(Base):
     rule = relationship("PilotDutyRule")
     pilot = relationship("Pilot")
     operator = relationship("User")
+
+
+class RecommendationStats(Base):
+    __tablename__ = "recommendation_stats"
+
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(DateTime(timezone=True), nullable=False, index=True)
+    query_count = Column(Integer, default=0, nullable=False)
+    assign_success_count = Column(Integer, default=0, nullable=False)
+    assign_fail_count = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

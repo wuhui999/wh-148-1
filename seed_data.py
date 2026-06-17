@@ -2,7 +2,8 @@ from datetime import datetime, timedelta
 from database import engine, SessionLocal
 from models import (
     Base, User, Pilot, Berth, Ship, TideWindow, SafetyMarginConfig,
-    TransportVessel, PilotDutyRule, UserRole, ShipType, PilotQualification, VesselStatus
+    TransportVessel, PilotDutyRule, PilotTask, UserRole, ShipType,
+    PilotQualification, VesselStatus, TaskStatus
 )
 from security import get_password_hash
 
@@ -36,7 +37,7 @@ try:
                 is_active=True
             )
         ])
-        print("✓ 用户数据已创建 (admin/admin123, dispatcher/disp123)")
+        print("[OK] 用户数据已创建 (admin/admin123, dispatcher/disp123)")
     else:
         print("- 用户数据已存在，跳过")
 
@@ -75,7 +76,7 @@ try:
                 is_active=True
             )
         ])
-        print("✓ 引航员数据已创建 (4名，各级资质)")
+        print("[OK] 引航员数据已创建 (4名，各级资质)")
     else:
         print("- 引航员数据已存在，跳过")
 
@@ -87,7 +88,7 @@ try:
             Berth(code="B04", name="4号杂货泊位", max_draft=10.0, max_length=200),
             Berth(code="B05", name="5号客轮泊位", max_draft=9.5, max_length=250)
         ])
-        print("✓ 泊位数据已创建 (5个泊位)")
+        print("[OK] 泊位数据已创建 (5个泊位)")
     else:
         print("- 泊位数据已存在，跳过")
 
@@ -142,7 +143,7 @@ try:
                 flag="JAPAN"
             )
         ])
-        print("✓ 船舶数据已创建 (6艘不同类型船舶)")
+        print("[OK] 船舶数据已创建 (6艘不同类型船舶)")
     else:
         print("- 船舶数据已存在，跳过")
 
@@ -215,7 +216,7 @@ try:
             ))
 
         db.add_all(tide_data)
-        print(f"✓ 潮汐窗口数据已创建 ({len(tide_data)}个未来7天的窗口)")
+        print(f"[OK] 潮汐窗口数据已创建 ({len(tide_data)}个未来7天的窗口)")
     else:
         print("- 潮汐窗口数据已存在，跳过")
 
@@ -228,7 +229,7 @@ try:
             SafetyMarginConfig(ship_type=ShipType.GENERAL, draft_margin=0.3, time_margin_minutes=30),
             SafetyMarginConfig(ship_type=ShipType.RORO, draft_margin=0.3, time_margin_minutes=30)
         ])
-        print("✓ 安全余量配置已创建 (6种船舶类型)")
+        print("[OK] 安全余量配置已创建 (6种船舶类型)")
     else:
         print("- 安全余量配置已存在，跳过")
 
@@ -268,7 +269,7 @@ try:
                 maintenance_notes=None
             )
         ])
-        print("✓ 交通艇数据已创建 (4艘，其中1艘维护中)")
+        print("[OK] 交通艇数据已创建 (4艘，其中1艘维护中)")
     else:
         print("- 交通艇数据已存在，跳过")
 
@@ -280,7 +281,7 @@ try:
             max_consecutive_work_minutes=480,
             is_active=True
         ))
-        print("✓ 全局执勤规则已创建 (每日5单 / 休息60分钟 / 连续8小时)")
+        print("[OK] 全局执勤规则已创建 (每日5单 / 休息60分钟 / 连续8小时)")
     else:
         print("- 全局执勤规则已存在，跳过")
 
@@ -295,9 +296,60 @@ try:
                 max_consecutive_work_minutes=240,
                 is_active=True
             ))
-            print(f"✓ 个人执勤规则已创建 (李引航：每日2单 / 休息120分钟 / 连续4小时 - 更严格)")
+            print(f"[OK] 个人执勤规则已创建 (李引航：每日2单 / 休息120分钟 / 连续4小时 - 更严格)")
     else:
         print("- 个人执勤规则已存在，跳过")
+
+    if not db.query(PilotTask).first():
+        db.flush()
+
+        pilot_li = db.query(Pilot).filter(Pilot.name == "李引航").first()
+        vessel_1 = db.query(TransportVessel).filter(TransportVessel.name == "交通艇01号").first()
+        vessel_2 = db.query(TransportVessel).filter(TransportVessel.name == "交通艇02号").first()
+        ship_container = db.query(Ship).filter(Ship.ship_type == ShipType.CONTAINER).first()
+        berth_1 = db.query(Berth).filter(Berth.code == "B01").first()
+
+        tide_window = None
+        if berth_1:
+            tide_window = db.query(TideWindow).filter(
+                TideWindow.berth_id == berth_1.id
+            ).order_by(TideWindow.window_start).first()
+
+        if pilot_li and vessel_1 and vessel_2 and ship_container and berth_1 and tide_window:
+            task1_time = tide_window.window_start + timedelta(minutes=30)
+            task2_time = task1_time + timedelta(hours=3)
+
+            db.add_all([
+                PilotTask(
+                    task_number="PLTDEMO001",
+                    ship_id=ship_container.id,
+                    berth_id=berth_1.id,
+                    pilot_id=pilot_li.id,
+                    vessel_id=vessel_1.id,
+                    tide_window_id=tide_window.id,
+                    task_type="进港",
+                    planned_boarding_time=task1_time,
+                    boarding_point="锚地",
+                    status=TaskStatus.COMPLETED
+                ),
+                PilotTask(
+                    task_number="PLTDEMO002",
+                    ship_id=ship_container.id,
+                    berth_id=berth_1.id,
+                    pilot_id=pilot_li.id,
+                    vessel_id=vessel_2.id,
+                    tide_window_id=tide_window.id,
+                    task_type="出港",
+                    planned_boarding_time=task2_time,
+                    boarding_point="泊位",
+                    status=TaskStatus.COMPLETED
+                )
+            ])
+            print(f"[OK] 演示任务已创建 (李引航已完成2单，达到每日上限 - 用于演示执勤规则限制)")
+        else:
+            print(f"- 演示任务创建条件不满足 (pilot={bool(pilot_li)}, vessel1={bool(vessel_1)}, vessel2={bool(vessel_2)}, ship={bool(ship_container)}, berth={bool(berth_1)}, tide={bool(tide_window)})")
+    else:
+        print("- 演示任务已存在，跳过")
 
     db.commit()
     print("\n种子数据初始化完成！")

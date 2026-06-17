@@ -317,6 +317,43 @@ class PilotTaskResponse(BaseModel):
         from_attributes = True
 
 
+class RecommendationBlockReason(str, Enum):
+    QUALIFICATION = "qualification"
+    TIME_CONFLICT = "time_conflict"
+    DUTY_RULE = "duty_rule"
+    VESSEL = "vessel"
+    TIDE = "tide"
+
+
+class RecommendationItem(BaseModel):
+    rank: int
+    available: bool
+    pilot: PilotResponse
+    vessel: TransportVesselResponse
+    score: float
+    reasons: List[str] = []
+    block_reasons: List[RecommendationBlockReason] = []
+
+
+class RecommendationResponse(BaseModel):
+    task_id: int
+    recommendations: List[RecommendationItem] = []
+    total_count: int = 0
+
+
+class RecommendationAssignRequest(BaseModel):
+    rank: int
+
+
+class RecommendationStatsResponse(BaseModel):
+    date: Optional[datetime] = None
+    query_count: int = 0
+    assign_success_count: int = 0
+    assign_fail_count: int = 0
+    period_start: Optional[datetime] = None
+    period_end: Optional[datetime] = None
+
+
 class TaskMatchResult(BaseModel):
     task_id: Optional[int] = None
     valid: bool
@@ -326,6 +363,7 @@ class TaskMatchResult(BaseModel):
     available_pilots: List[PilotResponse] = []
     available_vessels: List[TransportVesselResponse] = []
     duty_excluded_pilots: List[dict] = []
+    recommendations: List[RecommendationItem] = []
 
 
 class AuditLogBase(BaseModel):
